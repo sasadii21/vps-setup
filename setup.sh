@@ -10,7 +10,7 @@ fi
 if [ -n "$1" ]; then
   DOMAIN="$1"
 else
-  read -p "Please enter your domain name: " DOMAIN
+  read -p "لطفا نام دامنه خود را وارد کنید (example.com): " DOMAIN
 fi
 
 if [ -z "$DOMAIN" ]; then
@@ -18,60 +18,62 @@ if [ -z "$DOMAIN" ]; then
   exit
 fi
 
-echo "--- شروع نصب برای دامین: $DOMAIN ---"
+echo "--- شروع نصب سایت ترجمک روی دامین: $DOMAIN ---"
 
-# 0. تلاش برای باز کردن پورت‌ها (حل مشکل فایروال)
+# 0. تنظیم فایروال
 echo "--- در حال تنظیم فایروال ---"
 ufw allow 80/tcp
 ufw allow 443/tcp
-# اگر از iptables استفاده می‌کنید دستورات زیر اجرا می‌شوند (اگر نه نادیده گرفته می‌شوند)
 iptables -I INPUT -p tcp --dport 80 -j ACCEPT
 iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
 # 1. نصب پیش‌نیازها
 echo "--- آپدیت و نصب پکیج‌ها ---"
 apt update -y
-apt install nginx certbot python3-certbot-nginx unzip curl -y
+apt install nginx certbot python3-certbot-nginx unzip curl wget -y
 
-# 2. نصب قالب سایت (سایت پوششی)
-echo "--- نصب قالب ---"
+# 2. نصب پروژه ترجمک (سایت فارسی)
+echo "--- در حال دریافت و نصب پروژه ترجمک ---"
 rm -rf /var/www/html/*
-wget -O template.zip https://github.com/StartBootstrap/startbootstrap-agency/archive/gh-pages.zip
 
-if [ -f "template.zip" ]; then
-    unzip -o template.zip
-    mv startbootstrap-agency-gh-pages/* /var/www/html/
-    rm -rf startbootstrap-agency-gh-pages template.zip
+# دانلود آخرین نسخه پروژه از گیت‌هاب
+wget -O tarjomak.zip https://github.com/mimalef70/tarjomak/archive/refs/heads/master.zip
+
+if [ -f "tarjomak.zip" ]; then
+    unzip -o tarjomak.zip
+    # انتقال محتویات پوشه استخراج شده (tarjomak-master) به روت وب‌سایت
+    mv tarjomak-master/* /var/www/html/
+    rm -rf tarjomak-master tarjomak.zip
+    echo "✅ سایت ترجمک با موفقیت نصب شد."
 else
-    echo "<html><h1>Welcome to $DOMAIN</h1></html>" > /var/www/html/index.html
+    echo "خطا در دانلود قالب. یک صفحه پیش‌فرض ساخته شد."
+    echo "<html><body style='direction:rtl; text-align:center;'><h1>در حال بروزرسانی...</h1></body></html>" > /var/www/html/index.html
 fi
 
-# پرمیشن‌ها
+# تنظیم پرمیشن‌ها
 chown -R www-data:www-data /var/www/html
 chmod -R 755 /var/www/html
 
 # 3. دریافت SSL
-echo "--- دریافت SSL ---"
+echo "--- دریافت SSL (ممکن است لحظاتی طول بکشد) ---"
 systemctl stop nginx
-# کمی صبر برای اطمینان از آزاد شدن پورت 80
 sleep 2
 
 certbot certonly --standalone -d $DOMAIN --non-interactive --agree-tos --register-unsafely-without-email
 
 if [ $? -ne 0 ]; then
     echo "❌ خطا در دریافت SSL."
-    echo "لطفاً مطمئن شوید که پروکسی کلودفلر (ابر نارنجی) خاموش است و پورت 80 باز است."
+    echo "نکته: مطمئن شوید پروکسی کلودفلر (ابر نارنجی) خاموش است."
     systemctl start nginx
     exit
 fi
 
-# 4. کانفیگ Nginx (اصلاح شده)
-echo "--- کانفیگ Nginx ---"
+# 4. کانفیگ Nginx
+echo "--- کانفیگ نهایی Nginx ---"
 cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
-    # ریدایرکت به HTTPS
     return 301 https://\$host\$request_uri;
 }
 
@@ -95,6 +97,6 @@ systemctl start nginx
 systemctl restart nginx
 
 echo "----------------------------------------------"
-echo "✅ نصب با موفقیت تمام شد!"
-echo "🌐 سایت شما: https://$DOMAIN"
+echo "✅ تبریک! سایت 'ترجمک' با موفقیت بالا آمد."
+echo "🌐 آدرس شما: https://$DOMAIN"
 echo "----------------------------------------------"
