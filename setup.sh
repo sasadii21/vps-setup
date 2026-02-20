@@ -32,22 +32,24 @@ echo "--- آپدیت و نصب پکیج‌ها ---"
 apt update -y
 apt install nginx certbot python3-certbot-nginx unzip curl wget -y
 
-# 2. نصب پروژه ترجمک (سایت فارسی)
+# 2. نصب پروژه ترجمک (بخش سایت)
 echo "--- در حال دریافت و نصب پروژه ترجمک ---"
+# پاکسازی کامل مسیر برای جلوگیری از تداخل پوشه‌ها
 rm -rf /var/www/html/*
 
-# دانلود آخرین نسخه پروژه از گیت‌هاب
+# دانلود در پوشه موقت
+cd /tmp
 wget -O tarjomak.zip https://github.com/mimalef70/tarjomak/archive/refs/heads/master.zip
 
 if [ -f "tarjomak.zip" ]; then
     unzip -o tarjomak.zip
-    # انتقال محتویات پوشه استخراج شده (tarjomak-master) به روت وب‌سایت
-    mv tarjomak-master/* /var/www/html/
+    # کپی کردن فقط محتویات پوشه docs به روت وب‌سرور
+    cp -r tarjomak-master/docs/* /var/www/html/
+    # پاکسازی فایل‌های دانلودی
     rm -rf tarjomak-master tarjomak.zip
-    echo "✅ سایت ترجمک با موفقیت نصب شد."
+    echo "✅ فایل‌های سایت با موفقیت منتقل شدند."
 else
-    echo "خطا در دانلود قالب. یک صفحه پیش‌فرض ساخته شد."
-    echo "<html><body style='direction:rtl; text-align:center;'><h1>در حال بروزرسانی...</h1></body></html>" > /var/www/html/index.html
+    echo "<html><body style='direction:rtl; text-align:center;'><h1>خطا در دانلود قالب</h1></body></html>" > /var/www/html/index.html
 fi
 
 # تنظیم پرمیشن‌ها
@@ -55,21 +57,20 @@ chown -R www-data:www-data /var/www/html
 chmod -R 755 /var/www/html
 
 # 3. دریافت SSL
-echo "--- دریافت SSL (ممکن است لحظاتی طول بکشد) ---"
+echo "--- دریافت SSL ---"
 systemctl stop nginx
 sleep 2
 
 certbot certonly --standalone -d $DOMAIN --non-interactive --agree-tos --register-unsafely-without-email
 
 if [ $? -ne 0 ]; then
-    echo "❌ خطا در دریافت SSL."
-    echo "نکته: مطمئن شوید پروکسی کلودفلر (ابر نارنجی) خاموش است."
+    echo "❌ خطا در دریافت SSL. بررسی کنید دامنه به IP وصل باشد و پروکسی کلودفلر خاموش باشد."
     systemctl start nginx
     exit
 fi
 
 # 4. کانفیگ Nginx
-echo "--- کانفیگ نهایی Nginx ---"
+echo "--- کانفیگ Nginx ---"
 cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 80;
@@ -97,6 +98,6 @@ systemctl start nginx
 systemctl restart nginx
 
 echo "----------------------------------------------"
-echo "✅ تبریک! سایت 'ترجمک' با موفقیت بالا آمد."
-echo "🌐 آدرس شما: https://$DOMAIN"
+echo "✅ نصب با موفقیت تمام شد و تداخل پوشه‌ها رفع شد."
+echo "🌐 سایت شما: https://$DOMAIN"
 echo "----------------------------------------------"
