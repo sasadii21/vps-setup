@@ -15,6 +15,7 @@ wget https://raw.githubusercontent.com/sasadii21/vps-setup/main/setup4.sh
 chmod +x setup4.sh
 ./setup4.sh
 
+
 wget https://raw.githubusercontent.com/sasadii21/vps-setup/main/optimize-nodes.sh
 chmod +x optimize-nodes.sh
 ./optimize-nodes.sh
