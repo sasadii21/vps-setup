@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ip6tun - مدیریت تونل IPv6 over IPv4 (SIT) بین سرورهای لینوکس
-#  Version : 1.0.0
+#  Version : 1.0.1
 # =============================================================================
 set -uo pipefail
 
-VERSION="1.0.0"
-REPO_RAW="https://raw.githubusercontent.com/YOUR_USER/ip6tun/main/ip6tun.sh"
+VERSION="1.0.1"
+REPO_RAW="${IP6TUN_REPO_RAW:-https://raw.githubusercontent.com/sasadii21/vps-setup/main/ip6tun.sh}"
 INSTALL_PATH="/usr/local/bin/ip6tun"
 CONF_DIR="/etc/ip6tun"
 CONF_FILE="${CONF_DIR}/tunnels.conf"
@@ -382,9 +382,15 @@ cmd_install() {
         need curl
         local tmp; tmp=$(mktemp)
         info "دانلود نسخه جدید از گیت‌هاب..."
+        info "آدرس: ${REPO_RAW}"
         if ! curl -fsSL "$REPO_RAW" -o "$tmp"; then
             rm -f "$tmp"
-            err "دانلود ناموفق بود. مقدار REPO_RAW را بررسی کنید."
+            err "دانلود ناموفق بود. فایل ip6tun.sh در ریپو وجود ندارد یا آدرس REPO_RAW اشتباه است."
+            return 1
+        fi
+        if ! head -n1 "$tmp" | grep -q '^#!'; then
+            rm -f "$tmp"
+            err "فایل دانلودی یک اسکریپت معتبر نیست (احتمالاً صفحه خطاست)."
             return 1
         fi
         install -m 755 "$tmp" "$INSTALL_PATH"
