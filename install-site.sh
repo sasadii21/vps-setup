@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  install-site.sh  |  وبلاگ فنی با nginx، TLS 1.3، HTTP/2، HTTP/3 و X25519MLKEM768
-#  نسخه ۵
+#  نسخه ۶
 # =============================================================================
 set -Eeuo pipefail
 
@@ -355,7 +355,10 @@ nginx_has_http3() {
   local v ver
   v=$(nginx -V 2>&1 || true)
   ver=$(nginx_version)
-  [[ "$v" == *--with-http_v3_module* ]] && [ -n "$ver" ] && ver_ge "$ver" 1.25.0
+  if [[ "$v" == *--with-http_v3_module* ]] && [ -n "$ver" ] && ver_ge "$ver" 1.25.0; then
+    return 0
+  fi
+  return 1
 }
 
 # nginx رسمی (nginx.org) که http_v3 دارد
@@ -379,12 +382,12 @@ install_nginx_official() {
 ensure_sites_include() {
   local line='include /etc/nginx/sites-enabled/*;'
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-  if grep -qF "$line" "$NGINX_MAIN"; then
+  if grep -qE 'include[[:space:]]+/etc/nginx/sites-enabled/\*;' "$NGINX_MAIN"; then
     return 0
   fi
   cp -f "$NGINX_MAIN" "$NGINX_MAIN.bak"
   awk -v inc="    $line" '{ print } !done && /^[ \t]*http[ \t]*[{]/ { print inc; done = 1 }' "$NGINX_MAIN.bak" > "$NGINX_MAIN"
-  if ! grep -qF "$line" "$NGINX_MAIN"; then
+  if ! grep -qE 'include[[:space:]]+/etc/nginx/sites-enabled/\*;' "$NGINX_MAIN"; then
     cp -f "$NGINX_MAIN.bak" "$NGINX_MAIN"
     die "بلاک http در $NGINX_MAIN پیدا نشد. فایل بکاپ: $NGINX_MAIN.bak"
   fi
@@ -515,10 +518,13 @@ if [ -z "$DOMAIN" ]; then
 fi
 DOMAIN="${DOMAIN,,}"; DOMAIN="${DOMAIN#http*://}"; DOMAIN="${DOMAIN%%/*}"; DOMAIN="${DOMAIN%.}"
 [[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]] || die "دامنه نامعتبر است: $DOMAIN"
-if [ -n "$EMAIL" ]; then [[ "$EMAIL" =~ ^[^@\ ]+@[^@\ ]+\.[^@\ ]+$ ]] || die "ایمیل نامعتبر است."; fi
+if [ -n "$EMAIL" ]; then
+  [[ "$EMAIL" =~ ^[^@\ ]+@[^@\ ]+\.[^@\ ]+$ ]] || die "ایمیل نامعتبر است."
+fi
 if [ -n "$LOCAL_PORT" ]; then
-  [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && [ "$LOCAL_PORT" -ge 1024 ] && [ "$LOCAL_PORT" -le 65535 ] \
-    || die "پورت --local باید بین 1024 تا 65535 باشد."
+  if ! { [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && [ "$LOCAL_PORT" -ge 1024 ] && [ "$LOCAL_PORT" -le 65535 ]; }; then
+    die "پورت --local باید بین 1024 تا 65535 باشد."
+  fi
 fi
 
 case "$CA" in
@@ -526,8 +532,9 @@ case "$CA" in
     ACME_URL=""
     CA_NAME="Let's Encrypt"; CA_MARK="letsencrypt.org" ;;
   google)
-    [ -n "$EAB_KID" ] && [ -n "$EAB_HMAC" ] \
-      || die "برای --ca google باید --eab-kid و --eab-hmac را بدهید (از Google Cloud Certificate Manager، بخش Public CA)."
+    if [ -z "$EAB_KID" ] || [ -z "$EAB_HMAC" ]; then
+      die "برای --ca google باید --eab-kid و --eab-hmac را بدهید (از Google Cloud Certificate Manager، بخش Public CA)."
+    fi
     if [ "$STAGING" -eq 1 ]; then ACME_URL="https://dv.acme-v02.test-api.pki.goog/directory"
     else ACME_URL="https://dv.acme-v02.api.pki.goog/directory"; fi
     CA_NAME="Google Trust Services"; CA_MARK="pki.goog" ;;
@@ -553,7 +560,7 @@ info "نصب پیش‌نیازها"
 apt-get update -qq
 apt-get install -y -qq nginx certbot curl dnsutils openssl ca-certificates iproute2 gnupg
 
-if [ -z "$LOCAL_PORT" ] && ! nginx_has_http3 && [ "$NO_NGINX_REPO" -eq 0 ]; then
+if [ -z "$LOCAL_PORT" ] && [ "$NO_NGINX_REPO" -eq 0 ] && ! nginx_has_http3; then
   install_nginx_official
 fi
 
@@ -616,7 +623,7 @@ fi
 # ============================ DNS ============================================
 proceed_or_abort() {
   warn "$1"
-  [ "$FORCE" -eq 1 ] && return 0
+  if [ "$FORCE" -eq 1 ]; then return 0; fi
   if [ -t 0 ]; then
     read -r -p "ادامه بدهم؟ [y/N] " ans
     [[ "$ans" =~ ^[Yy]$ ]] || die "متوقف شد."
@@ -728,13 +735,76 @@ systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 
 if [ "$NO_DRY" -eq 0 ] && [ "$STAGING" -eq 0 ]; then
   info "تست تمدید خودکار (dry-run)"
-  certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1 || warn "تست تمدید ناموفق بود؛ لاگ: /var/log/letsencrypt/letsencrypt.log"
+  if ! certbot renew --cert-name "$DOMAIN" --dry-run >/dev/null 2>&1; then
+    warn "تست تمدید ناموفق بود؛ لاگ: /var/log/letsencrypt/letsencrypt.log"
+  fi
+fi
+
+# ============================ تأیید خودکار سرویس ============================
+# همه‌ی بررسی‌ها از همین سرور انجام می‌شود. اگر IP عمومی پیدا شود، با همان IP تست می‌شود.
+info "تأیید خودکار سرویس"
+if [ -n "$LOCAL_PORT" ]; then
+  TEST_HOST="127.0.0.1"; TEST_PORT="$LOCAL_PORT"
+else
+  TEST_HOST="${SERVER_IP:-127.0.0.1}"; TEST_PORT="443"
+fi
+BASE_URL="https://$DOMAIN:$TEST_PORT"
+RESOLVE=(--resolve "$DOMAIN:$TEST_PORT:$TEST_HOST")
+
+TLS_OUT=$(echo | timeout 10 openssl s_client -connect "$TEST_HOST:$TEST_PORT" -servername "$DOMAIN" -tls1_3 2>/dev/null || true)
+ISSUER=$(echo | timeout 10 openssl s_client -connect "$TEST_HOST:$TEST_PORT" -servername "$DOMAIN" 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)
+H2_VER=$(curl -s --max-time 15 "${RESOLVE[@]}" -o /dev/null -w '%{http_version}' "$BASE_URL/" 2>/dev/null || true)
+HDRS=$(curl -sI --max-time 15 "${RESOLVE[@]}" "$BASE_URL/" 2>/dev/null || true)
+ALT_SVC=$(printf '%s\n' "$HDRS" | grep -i '^alt-svc' || true)
+SEC_CODE=$(curl -s --max-time 15 "${RESOLVE[@]}" -o /dev/null -w '%{http_code}' "$BASE_URL/security" 2>/dev/null || true)
+
+H3_REAL=""
+if [ -z "$LOCAL_PORT" ]; then
+  CURL_FEATURES=$(curl -V 2>/dev/null || true)
+  if [[ "$CURL_FEATURES" == *HTTP3* ]]; then
+    H3_REAL=$(curl -s --max-time 15 --http3-only "${RESOLVE[@]}" -o /dev/null -w '%{http_version}' "$BASE_URL/" 2>/dev/null || true)
+  fi
+fi
+
+TLS13=0; if [[ "$TLS_OUT" == *"TLSv1.3"* ]]; then TLS13=1; fi
+H2OK=0; if [ "$H2_VER" = "2" ]; then H2OK=1; fi
+CERTOK=0; if [[ "$ISSUER" == *"$CA_NAME"* ]]; then CERTOK=1; fi
+ADV=0; if [[ "$ALT_SVC" == *'h3=":443"'* ]]; then ADV=1; fi
+H3R=0; if [ "$H3_REAL" = "3" ]; then H3R=1; fi
+SECOK=0; if [ "$SEC_CODE" = "200" ]; then SECOK=1; fi
+
+show_check() { # $1 = 1/0   $2 = برچسب
+  if [ "$1" -eq 1 ]; then echo " ${G}✔${N} $2"; else echo " ${R}✘${N} $2"; fi
+}
+
+echo
+show_check "$TLS13" "TLS 1.3"
+show_check "$H2OK" "HTTP/2 (نسخه‌ی پاسخ: ${H2_VER:-نامشخص})"
+show_check "$CERTOK" "گواهی معتبر از $CA_NAME"
+show_check "$ADV" "HTTP/3 اعلام شده در Alt-Svc"
+if [ -n "$LOCAL_PORT" ]; then
+  echo " — HTTP/3 در حالت لوکال غیرفعال است"
+elif [ -n "$H3_REAL" ]; then
+  show_check "$H3R" "HTTP/3 واقعی با curl (نسخه‌ی پاسخ: $H3_REAL)"
+else
+  echo " — curl این سیستم HTTP/3 ندارد؛ تست واقعی انجام نشد"
+fi
+show_check "$SECOK" "صفحه‌ی امنیت /security (کد HTTP: ${SEC_CODE:-نامشخص})"
+echo
+
+if [ "$ADV" -eq 1 ] && [ "$H3R" -eq 0 ] && [ -z "$LOCAL_PORT" ]; then
+  warn "اگر HTTP/3 از اینترنت کار نمی‌کند، UDP 443 را در فایروال ابری یا گروه امنیتی VPS باز کنید. این مورد از داخل سرور قابل بررسی نیست."
+fi
+if [ "$TLS13" -eq 0 ] || [ "$H2OK" -eq 0 ] || [ "$CERTOK" -eq 0 ] || [ "$SECOK" -eq 0 ]; then
+  warn "برخی بررسی‌های اصلی ناموفق بود. لاگ nginx: sudo tail -n 50 /var/log/nginx/error.log"
 fi
 
 # ============================ خلاصه =========================================
 SHORT_ID=$(openssl rand -hex 8)
+mark() { if [ "$1" -eq 1 ]; then echo "✔"; else echo "✘"; fi; }
 pq_txt="✘ (OpenSSL ۳٫۵+ لازم است)"; if [ "$PQ_OK" -eq 1 ]; then pq_txt="✔"; fi
-h3_txt="✘ (nginx با http_v3 لازم است)"; if [ "$H3_OK" -eq 1 ]; then h3_txt="✔"; fi
+h3_line="✘"; if [ "$ADV" -eq 1 ]; then h3_line="✔ (اعلام شده)"; fi
+if [ -n "$H3_REAL" ] && [ "$H3R" -eq 1 ]; then h3_line="✔ (تست واقعی موفق)"; fi
 
 cat <<EOF
 
@@ -742,11 +812,11 @@ ${G}==============================================================${N}
  ✅ نصب تمام شد  →  https://$DOMAIN
 ${G}==============================================================${N}
  nginx              : $(nginx_version)
- TLS 1.3            : ✔
- HTTP/2             : ✔
+ TLS 1.3            : $(mark "$TLS13")
+ HTTP/2             : $(mark "$H2OK")
  X25519MLKEM768     : $pq_txt
- HTTP/3 (QUIC)      : $h3_txt
- گواهی              : $CA_NAME
+ HTTP/3 (QUIC)      : $h3_line
+ گواهی              : $CA_NAME ($(mark "$CERTOK"))
  صفحه وضعیت         : https://$DOMAIN/security
 
  تنظیمات Reality:
