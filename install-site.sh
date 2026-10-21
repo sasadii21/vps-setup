@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  install-site.sh  |  وبلاگ فنی با nginx، TLS 1.3، HTTP/2، HTTP/3 و X25519MLKEM768
-#  نسخه ۶
+#  نسخه ۷ (همراه با کامپایل خودکار و ایزوله‌ی OpenSSL 3.5 برای تبادل کلید پساکوانتومی)
 # =============================================================================
 set -Eeuo pipefail
+
+export PATH="/usr/local/bin:$PATH"
 
 if [ -t 1 ]; then R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'; else R=""; G=""; Y=""; C=""; N=""; fi
 info() { echo "${C}➜${N} $*"; }
@@ -11,6 +13,7 @@ ok()   { echo "${G}✔${N} $*"; }
 warn() { echo "${Y}⚠${N}  $*"; }
 die()  { echo "${R}✘ $*${N}" >&2; exit 1; }
 trap 'echo "${R}✘ خطای غیرمنتظره در خط $LINENO: $BASH_COMMAND${N}" >&2' ERR
+SCRIPT_SELF="$(readlink -f "$0")"
 
 usage() {
 cat <<'EOF'
@@ -18,24 +21,26 @@ cat <<'EOF'
   sudo bash install-site.sh [دامنه] [گزینه‌ها]
 
 گزینه‌ها:
-  -d, --domain دامنه       نام دامنه (یا به‌صورت آرگومان اول)
-  -e, --email ایمیل        ایمیل برای حساب ACME (اختیاری)
-  -l, --local پورت         nginx فقط روی 127.0.0.1:پورت گوش بدهد (وقتی سرویس دیگری روی 443 است)
-      --ca نام             letsencrypt (پیش‌فرض) یا google (Google Trust Services)
-      --eab-kid شناسه      Key ID برای EAB (فقط همراه با --ca google)
-      --eab-hmac کلید      HMAC key برای EAB (فقط همراه با --ca google)
-      --no-nginx-repo      nginx رسمی (nginx.org) را برای HTTP/3 نصب نکن
-      --staging            گواهی آزمایشی (بدون محدودیت نرخ)
-      --force              با وجود هشدارها ادامه بده
-      --overwrite-site     فایل‌های سایت را از نو بنویس
-      --no-firewall        به فایروال دست نزن
-      --no-dryrun          تست تمدید خودکار را انجام نده
-  -h, --help               راهنما
+  -d, --domain دامنه        نام دامنه (یا به‌صورت آرگومان اول)
+  -e, --email ایمیل         ایمیل برای حساب ACME (اختیاری)
+  -l, --local پورت          nginx فقط روی 127.0.0.1:پورت گوش بدهد (وقتی سرویس دیگری روی 443 است)
+      --ca نام              letsencrypt (پیش‌فرض) یا google (Google Trust Services)
+      --eab-kid شناسه       Key ID برای EAB (فقط همراه با --ca google)
+      --eab-hmac کلید       HMAC key برای EAB (فقط همراه با --ca google)
+      --no-nginx-repo       nginx رسمی (nginx.org) را برای HTTP/3 نصب نکن
+      --no-build-openssl    OpenSSL 3.5 را کامپایل نکن (حتی اگر سیستم نداشته باشد)
+      --upgrade-os          سیستم‌عامل را به LTS بعدی ارتقا بده
+      --yes-upgrade-os      تأیید خودکار ارتقا (برای اجرای غیرتعاملی)
+      --staging             گواهی آزمایشی (بدون محدودیت نرخ)
+      --force               با وجود هشدارها ادامه بده
+      --overwrite-site      فایل‌های سایت را از نو بنویس
+      --no-firewall         به فایروال دست نزن
+      --no-dryrun           تست تمدید خودکار را انجام نده
+  -h, --help                راهنما
 EOF
 }
 
 # ============================ محتوای سایت ====================================
-# فرمت هر نوشته: slug|برچسب|عنوان|توضیح
 POSTS=(
   "tls-13|امنیت|چرا TLS 1.3 را فعال کنیم؟|نگاهی کوتاه به تفاوت TLS 1.3 با نسخه‌های قدیمی و دلیل اینکه سرعت و امنیت هر دو بهتر می‌شوند."
   "post-quantum|امنیت|کلیدهای ترکیبی پساکوانتومی در TLS|X25519MLKEM768 چیست، چرا ترکیب دو الگوریتم مهم است و از چه چیزی محافظت می‌کند."
@@ -43,7 +48,6 @@ POSTS=(
   "nginx-logs|ابزار|خواندن لاگ nginx بدون خسته شدن|چند دستور ساده برای پیدا کردن خطاها، درخواست‌های پرتکرار و کدهای وضعیت."
 )
 
-# کارت‌های فهرست نوشته‌ها: $1 = حداکثر تعداد (۰ یعنی همه)
 cards() {
   local i=0 p slug tag ttl dsc
   for p in "${POSTS[@]}"; do
@@ -54,8 +58,6 @@ cards() {
   done
 }
 
-# قالب مشترک صفحه‌ها
-# $1 مسیر فایل  $2 عنوان  $3 توضیح  $4 مسیر canonical ("-" یعنی بدون)  $5 noindex (0/1)  بدنه از stdin
 layout() {
   local rel="$1" title="$2" desc="$3" path="$4" noindex="${5:-0}" canon="" robots=""
   if [ "$path" != "-" ]; then canon="<link rel=\"canonical\" href=\"https://$DOMAIN$path\">"; fi
@@ -102,7 +104,6 @@ TAIL
   } > "$SITE_ROOT/$rel"
 }
 
-# نوشتن یک نوشته: slug را می‌گیرد، بدنه را از stdin می‌خواند
 article() {
   local slug="$1" line="" tag ttl dsc body p
   for p in "${POSTS[@]}"; do
@@ -120,7 +121,6 @@ $body
 EOF
 }
 
-# یک ردیف وضعیت برای صفحه امنیت: برچسب، وضعیت(1/0)، متن وقتی فعال، متن وقتی غیرفعال
 feat() {
   local cls="ok" mk="✔" text="$3"
   if [ "$2" != 1 ]; then cls="no"; mk="—"; text="${4:-}"; fi
@@ -228,7 +228,6 @@ CSS
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#1f4d45"/><path d="M32 13l17 6v13c0 10-7 17-17 21-10-4-17-11-17-21V19z" fill="none" stroke="#f0866c" stroke-width="4" stroke-linejoin="round"/><path d="M24 33l6 6 10-11" fill="none" stroke="#faf8f3" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>
 SVG
 
-  # ---- صفحه‌ها ----
   layout index.html "$DOMAIN | یادداشت‌های فنی درباره وب و سرور" "یادداشت‌های فنی درباره nginx، TLS، HTTP/3 و نگهداری سرور لینوکس." "/" 0 <<EOF
 <section class="hero">
   <span class="eyebrow">یادداشت‌های فنی</span>
@@ -304,7 +303,6 @@ EOF
 <section class="page"><h1>خطای سرور</h1><p>مشکلی پیش آمده است. لطفاً کمی بعد دوباره تلاش کنید. <a href="/">بازگشت به خانه</a></p></section>
 EOF
 
-  # ---- فایل‌های استاندارد ----
   local today rfc_now slug tag ttl dsc p
   today=$(date +%F); rfc_now=$(date -R)
 
@@ -343,14 +341,13 @@ EOF
   ok "فایل‌های سایت ساخته شد"
 }
 
-# ============================ توابع nginx ====================================
+# ============================ توابع نسخه و nginx ============================
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
 nginx_version() {
   nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
 }
 
-# بدون grep -q روی خروجی بزرگ، تا SIGPIPE با pipefail مشکل نسازد
 nginx_has_http3() {
   local v ver
   v=$(nginx -V 2>&1 || true)
@@ -361,7 +358,6 @@ nginx_has_http3() {
   return 1
 }
 
-# nginx رسمی (nginx.org) که http_v3 دارد
 install_nginx_official() {
   local os_id codename
   os_id=$(. /etc/os-release && echo "${ID:-ubuntu}")
@@ -369,16 +365,21 @@ install_nginx_official() {
   info "نصب nginx از مخزن رسمی nginx.org (برای HTTP/3)"
   install -d -m 755 /usr/share/keyrings
   if ! curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor --yes -o "$NGINX_KEYRING"; then
-    die "دریافت کلید مخزن nginx.org ناموفق بود."
+    warn "دریافت کلید مخزن nginx.org ناموفق بود."
+    return 1
   fi
   echo "deb [signed-by=$NGINX_KEYRING] http://nginx.org/packages/$os_id $codename nginx" > "$NGINX_REPO_LIST"
-  apt-get update -qq
-  # --force-confnew: فایل‌های پیکربندی nginx.org جایگزین نسخه‌ی Ubuntu شوند
-  apt-get install -y -qq -o Dpkg::Options::=--force-confnew nginx || die "نصب nginx از مخزن رسمی ناموفق بود."
+  apt-get update -qq || true
+  if ! apt-get install -y -qq -o Dpkg::Options::=--force-confnew nginx; then
+    warn "نصب از مخزن nginx.org برای «$codename» ممکن نشد."
+    rm -f "$NGINX_REPO_LIST"
+    apt-get update -qq || true
+    return 1
+  fi
   ok "nginx نسخه‌ی $(nginx_version) نصب شد"
+  return 0
 }
 
-# اطمینان از اینکه nginx.conf فایل‌های sites-enabled را می‌خواند
 ensure_sites_include() {
   local line='include /etc/nginx/sites-enabled/*;'
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
@@ -413,7 +414,6 @@ server {
 EOF
 }
 
-# $1 = PQ (0/1)   $2 = HTTP/3 (0/1)
 write_nginx_conf() {
   local pq="$1" h3="$2" tls_l4 tls_l6="" l80_v6="" h3_l4="" h3_l6="" h3_dir="" alt="" pq_line=""
 
@@ -486,12 +486,234 @@ server {
 EOF
 }
 
+# ============================ مدیریت OpenSSL 3.5 ============================
+openssl_has_mlkem() {
+  local v
+  v=$(openssl version 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$v" ] && ver_ge "$v" 3.5.0; then return 0; fi
+  return 1
+}
+
+# نصب ایزوله‌ی OpenSSL 3.5 در /opt/openssl-pq و اتصال باینری nginx به آن
+install_openssl_pq() {
+  if [ -x /opt/openssl-pq/bin/openssl ] && [ -f /opt/openssl-pq/lib64/libssl.so.3 -o -f /opt/openssl-pq/lib/libssl.so.3 ]; then
+    ln -sf /opt/openssl-pq/bin/openssl /usr/local/bin/openssl
+    if command -v patchelf >/dev/null 2>&1 && [ -x /usr/sbin/nginx ]; then
+      patchelf --set-rpath "/opt/openssl-pq/lib64:/opt/openssl-pq/lib" /usr/sbin/nginx 2>/dev/null || true
+    fi
+    if nginx -V 2>&1 | grep -qE 'OpenSSL 3\.[5-9]'; then
+      ok "OpenSSL 3.5 از قبل نصب و به nginx متصل است"
+      return 0
+    fi
+  fi
+
+  info "کامپایل ایزوله‌ی OpenSSL 3.5.0 جهت فعال‌سازی X25519MLKEM768 (حدود ۲ تا ۵ دقیقه)..."
+  apt-get install -y -qq build-essential perl zlib1g-dev patchelf curl >/dev/null || {
+    warn "نصب ابزارهای کامپایل ناموفق بود."
+    return 1
+  }
+
+  local tmp="/tmp/openssl-3.5-build"
+  rm -rf "$tmp" && mkdir -p "$tmp"
+  local url1="https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz"
+  local url2="https://www.openssl.org/source/openssl-3.5.0.tar.gz"
+
+  if ! curl -fsSL --max-time 120 "$url1" | tar xz -C "$tmp" --strip-components=1 2>/dev/null; then
+    if ! curl -fsSL --max-time 120 "$url2" | tar xz -C "$tmp" --strip-components=1 2>/dev/null; then
+      warn "دریافت سورس OpenSSL 3.5.0 ناموفق بود."
+      rm -rf "$tmp"
+      return 1
+    fi
+  fi
+
+  (
+    cd "$tmp"
+    ./Configure --prefix=/opt/openssl-pq --openssldir=/opt/openssl-pq/ssl shared zlib \
+      -Wl,-rpath,/opt/openssl-pq/lib64 -Wl,-rpath,/opt/openssl-pq/lib >/dev/null 2>&1
+    make -j"$(nproc)" >/dev/null 2>&1
+    make install_sw >/dev/null 2>&1
+  ) || {
+    warn "کامپایل OpenSSL 3.5 ناموفق بود."
+    rm -rf "$tmp"
+    return 1
+  }
+  rm -rf "$tmp"
+
+  ln -sf /opt/openssl-pq/bin/openssl /usr/local/bin/openssl
+  if [ -x /usr/sbin/nginx ]; then
+    patchelf --set-rpath "/opt/openssl-pq/lib64:/opt/openssl-pq/lib" /usr/sbin/nginx
+  fi
+
+  # هوک apt برای جلوگیری از بازنشانی rpath در زمان بروزرسانی‌های بعدی nginx
+  cat > /etc/apt/apt.conf.d/99-nginx-pq-rpath <<'APT'
+DPkg::Post-Invoke { "if [ -x /usr/bin/patchelf ] && [ -d /opt/openssl-pq ] && [ -x /usr/sbin/nginx ]; then /usr/bin/patchelf --set-rpath /opt/openssl-pq/lib64:/opt/openssl-pq/lib /usr/sbin/nginx 2>/dev/null || true; fi"; };
+APT
+
+  ok "OpenSSL 3.5.0 نصب و باینری nginx به آن لینک شد"
+  return 0
+}
+
+# ============================ ارتقای سیستم‌عامل (اختیاری) ====================
+STATE_DIR="/var/lib/install-site"
+RESUME_UNIT="/etc/systemd/system/install-site-resume.service"
+OS_RUNNER="$STATE_DIR/os-upgrade.sh"
+
+build_resume_args() {
+  local a=("$DOMAIN")
+  if [ -n "$EMAIL" ]; then a+=(-e "$EMAIL"); fi
+  if [ -n "$LOCAL_PORT" ]; then a+=(--local "$LOCAL_PORT"); fi
+  if [ "$CA" = google ]; then a+=(--ca google --eab-kid "$EAB_KID" --eab-hmac "$EAB_HMAC"); fi
+  if [ "$STAGING" -eq 1 ]; then a+=(--staging); fi
+  if [ "$FORCE" -eq 1 ]; then a+=(--force); fi
+  if [ "$OVERWRITE" -eq 1 ]; then a+=(--overwrite-site); fi
+  if [ "$NO_FW" -eq 1 ]; then a+=(--no-firewall); fi
+  if [ "$NO_DRY" -eq 1 ]; then a+=(--no-dryrun); fi
+  if [ "$NO_NGINX_REPO" -eq 1 ]; then a+=(--no-nginx-repo); fi
+  if [ "$NO_BUILD_OPENSSL" -eq 1 ]; then a+=(--no-build-openssl); fi
+  RESUME_ARGS="${a[*]}"
+  return 0
+}
+
+write_resume_unit() {
+  build_resume_args
+  mkdir -p "$STATE_DIR"
+  if [ "$SCRIPT_SELF" != "$STATE_DIR/install-site.sh" ]; then
+    install -m 700 "$SCRIPT_SELF" "$STATE_DIR/install-site.sh"
+  fi
+  cat > "$RESUME_UNIT" <<EOF
+[Unit]
+Description=ادامه‌ی نصب سایت بعد از ارتقای سیستم‌عامل
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $STATE_DIR/install-site.sh $RESUME_ARGS --after-upgrade
+StandardOutput=append:/var/log/install-site-resume.log
+StandardError=append:/var/log/install-site-resume.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable install-site-resume.service >/dev/null 2>&1
+  return 0
+}
+
+write_os_runner() {
+  mkdir -p "$STATE_DIR"
+  cat > "$OS_RUNNER" <<'RUNNER'
+#!/bin/bash
+LOG=/var/log/install-site-os-upgrade.log
+{
+  echo "شروع ارتقا: $(date)"
+  do-release-upgrade -f DistUpgradeViewNonInteractive
+  rc=$?
+  echo "پایان ارتقا با کد $rc: $(date)"
+  if [ "$rc" -eq 0 ]; then
+    echo "ریبوت سرور..."
+    systemctl reboot
+  else
+    systemctl disable install-site-resume.service >/dev/null 2>&1 || true
+    echo "ارتقا ناموفق بود؛ ادامه‌ی خودکار غیرفعال شد."
+  fi
+} >> "$LOG" 2>&1
+RUNNER
+  chmod 700 "$OS_RUNNER"
+  return 0
+}
+
+os_upgrade_flow() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  if ! grep -q '^ID=ubuntu' /etc/os-release; then
+    die "ارتقای خودکار فقط برای Ubuntu پشتیبانی می‌شود."
+  fi
+  if openssl_has_mlkem; then
+    ok "OpenSSL از قبل ۳٫۵ یا بالاتر است؛ ارتقای سیستم‌عامل لازم نیست."
+    return 0
+  fi
+
+  info "بررسی امکان ارتقای سیستم‌عامل"
+  apt-get update -qq || true
+  apt-get install -y -qq update-manager-core curl >/dev/null
+  if [ -f /etc/update-manager/release-upgrades ]; then
+    if grep -q '^Prompt=' /etc/update-manager/release-upgrades; then
+      sed -i 's/^Prompt=.*/Prompt=lts/' /etc/update-manager/release-upgrades
+    else
+      echo 'Prompt=lts' >> /etc/update-manager/release-upgrades
+    fi
+  fi
+
+  local check new_rel free_gb xray_state backup p paths ans
+  check=$(do-release-upgrade -c 2>&1 || true)
+  new_rel=$(printf '%s\n' "$check" | grep 'New release' | head -n1 || true)
+  if [ -z "$new_rel" ]; then
+    die "ارتقای LTS جدیدی برای این سرور آماده نیست. بعداً دوباره امتحان کنید."
+  fi
+  ok "$new_rel"
+
+  free_gb=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9' || true)
+  if [ "${free_gb:-0}" -lt 6 ]; then
+    die "فضای خالی کافی نیست؛ حداقل ۶ گیگابایت لازم است (الان: ${free_gb:-0} گیگابایت)."
+  fi
+
+  xray_state=$(systemctl is-active xray 2>/dev/null || true)
+  info "وضعیت Xray قبل از ارتقا: ${xray_state:-نصب نشده}"
+
+  warn "این عملیات سیستم‌عامل را ارتقا می‌دهد و سرور را ریبوت می‌کند."
+  echo "    • مدت تقریبی: ۳۰ تا ۶۰ دقیقه"
+  echo "    • در این مدت سایت و Xray برای مدتی قطع خواهند بود"
+  echo "    • قبل از ارتقا بکاپ گرفته می‌شود"
+  echo "    • بعد از ریبوت، نصب سایت خودکار ادامه پیدا می‌کند"
+  echo "    • اگر SSH بعد از ریبوت وصل نشد، از کنسول VPS وارد شوید"
+  if [ "$YES_UPGRADE" -ne 1 ]; then
+    if [ ! -t 0 ]; then
+      die "اجرای غیرتعاملی: برای تأیید از --yes-upgrade-os استفاده کنید."
+    fi
+    read -r -p "برای ادامه کلمه UPGRADE را تایپ کنید: " ans
+    if [ "$ans" != "UPGRADE" ]; then die "لغو شد."; fi
+  fi
+
+  backup="/root/install-site-backup-$(date +%F-%H%M).tgz"
+  paths=()
+  for p in /etc/nginx /etc/letsencrypt /var/www /usr/local/etc/xray /etc/xray; do
+    if [ -e "$p" ]; then paths+=("$p"); fi
+  done
+  info "ساخت بکاپ: $backup"
+  if ! tar czf "$backup" "${paths[@]}" 2>/dev/null; then
+    die "ساخت بکاپ ناموفق بود؛ ارتقا متوقف شد."
+  fi
+  ok "بکاپ ساخته شد: $backup"
+
+  info "آماده‌سازی ارتقا"
+  if [ -f "$NGINX_REPO_LIST" ]; then mv -f "$NGINX_REPO_LIST" "$NGINX_REPO_LIST.disabled"; fi
+  apt-get update -qq || true
+  if ! apt-get full-upgrade -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+    die "به‌روزرسانی بسته‌ها قبل از ارتقا ناموفق بود."
+  fi
+
+  write_resume_unit
+  write_os_runner
+
+  info "شروع ارتقا در پس‌زمینه"
+  systemd-run --unit=install-site-os-upgrade --collect \
+    --description="ارتقای سیستم‌عامل برای install-site" \
+    /bin/bash "$OS_RUNNER" >/dev/null
+  ok "ارتقا شروع شد. بعد از اتمام، سرور ریبوت می‌شود و نصب سایت خودکار ادامه می‌یابد."
+  echo "    لاگ ارتقا:  tail -f /var/log/install-site-os-upgrade.log"
+  echo "    لاگ ادامه:  tail -f /var/log/install-site-resume.log"
+  exit 0
+}
+
 # ============================ بررسی‌های اولیه ================================
 [ "${EUID:-$(id -u)}" -eq 0 ] || die "با دسترسی root اجرا کنید (sudo)."
 command -v apt-get >/dev/null 2>&1 || die "فقط Debian/Ubuntu پشتیبانی می‌شود."
 
 DOMAIN=""; EMAIL=""; LOCAL_PORT=""; CA="letsencrypt"; EAB_KID=""; EAB_HMAC=""
-STAGING=0; FORCE=0; OVERWRITE=0; NO_FW=0; NO_DRY=0; NO_NGINX_REPO=0
+STAGING=0; FORCE=0; OVERWRITE=0; NO_FW=0; NO_DRY=0; NO_NGINX_REPO=0; NO_BUILD_OPENSSL=0
+UPGRADE_OS=0; YES_UPGRADE=0; AFTER_UPGRADE=0; RESUME_ARGS=""
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--domain) [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; DOMAIN="$2"; shift 2 ;;
@@ -501,6 +723,10 @@ while [ $# -gt 0 ]; do
     --eab-kid)   [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; EAB_KID="$2"; shift 2 ;;
     --eab-hmac)  [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; EAB_HMAC="$2"; shift 2 ;;
     --no-nginx-repo) NO_NGINX_REPO=1; shift ;;
+    --no-build-openssl) NO_BUILD_OPENSSL=1; shift ;;
+    --upgrade-os) UPGRADE_OS=1; shift ;;
+    --yes-upgrade-os) YES_UPGRADE=1; shift ;;
+    --after-upgrade) AFTER_UPGRADE=1; shift ;;
     --staging) STAGING=1; shift ;;
     --force) FORCE=1; shift ;;
     --overwrite-site) OVERWRITE=1; shift ;;
@@ -556,12 +782,27 @@ if [ -n "$LOCAL_PORT" ]; then info "حالت لوکال: nginx روی 127.0.0.1:
 
 # ============================ نصب پیش‌نیازها =================================
 export DEBIAN_FRONTEND=noninteractive
+
+if [ "$AFTER_UPGRADE" -eq 1 ]; then
+  info "ادامه‌ی نصب بعد از ارتقای سیستم‌عامل"
+  systemctl disable install-site-resume.service >/dev/null 2>&1 || true
+elif [ "$UPGRADE_OS" -eq 1 ]; then
+  os_upgrade_flow
+fi
+
 info "نصب پیش‌نیازها"
-apt-get update -qq
+apt-get update -qq || warn "به‌روزرسانی فهرست بسته‌ها کامل نبود؛ ادامه می‌دهیم."
 apt-get install -y -qq nginx certbot curl dnsutils openssl ca-certificates iproute2 gnupg
 
 if [ -z "$LOCAL_PORT" ] && [ "$NO_NGINX_REPO" -eq 0 ] && ! nginx_has_http3; then
-  install_nginx_official
+  install_nginx_official || warn "nginx رسمی نصب نشد؛ HTTP/3 ممکن است غیرفعال بماند."
+fi
+
+# بررسی وضعیت OpenSSL 3.5 و نصب خودکار در صورت نیاز
+if ! openssl_has_mlkem || ! nginx -V 2>&1 | grep -qE 'OpenSSL 3\.[5-9]'; then
+  if [ "$NO_BUILD_OPENSSL" -eq 0 ]; then
+    install_openssl_pq || warn "کامپایل OpenSSL 3.5 انجام نشد؛ تبادل کلید پساکوانتومی غیرفعال می‌ماند."
+  fi
 fi
 
 H3_AVAIL=0
@@ -587,7 +828,6 @@ for p in 80 "$TLS_PORT"; do
   fi
 done
 
-# پاکسازی: سایت پیش‌فرض و سایت پیش‌فرض nginx.org که با سایت ما تداخل می‌کنند
 rm -f /etc/nginx/sites-enabled/default
 if [ -f /etc/nginx/conf.d/default.conf ] && grep -q 'server_name[[:space:]]*localhost' /etc/nginx/conf.d/default.conf; then
   rm -f /etc/nginx/conf.d/default.conf
@@ -635,7 +875,7 @@ proceed_or_abort() {
 info "بررسی DNS"
 SERVER_IP=$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || curl -4 -fsS --max-time 8 https://ifconfig.me 2>/dev/null || true)
 DOMAIN_IP=$(dig +short A "$DOMAIN" @1.1.1.1 | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n1 || true)
-echo "   IP سرور: ${SERVER_IP:-نامشخص} | رکورد A دامنه: ${DOMAIN_IP:-ندارد}"
+echo "    IP سرور: ${SERVER_IP:-نامشخص} | رکورد A دامنه: ${DOMAIN_IP:-ندارد}"
 if [ -z "$DOMAIN_IP" ]; then
   proceed_or_abort "برای $DOMAIN رکورد A پیدا نشد."
 elif [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "$DOMAIN_IP" ]; then
@@ -649,7 +889,7 @@ if [ -n "$DOMAIN_IP6" ]; then
   fi
 fi
 
-# ============================ سایت ===========================================
+# ============================ ساخت فایل‌های وب‌سایت =========================
 mkdir -p "$ACME_ROOT"
 if [ ! -f "$SITE_ROOT/index.html" ] || [ "$OVERWRITE" -eq 1 ]; then
   write_site
@@ -657,7 +897,7 @@ else
   warn "سایت از قبل وجود دارد؛ محتوای آن دست نخورد."
 fi
 
-# ============================ گواهی SSL ======================================
+# ============================ دریافت گواهی SSL ===============================
 rm -f /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
 
 NEED_CERT=1; FORCE_RENEW=0
@@ -700,9 +940,10 @@ fi
 info "نوشتن کانفیگ نهایی nginx"
 PQ_ON=1; H3_ON=$H3_AVAIL
 ln -sf "$CONF" "/etc/nginx/sites-enabled/$DOMAIN"
+
 until write_nginx_conf "$PQ_ON" "$H3_ON" && nginx -t >/tmp/nginx-test.log 2>&1; do
   if [ "$PQ_ON" -eq 1 ]; then
-    warn "کانفیگ با X25519MLKEM768 پذیرفته نشد (OpenSSL این سرور از آن پشتیبانی نمی‌کند)؛ بدون آن ادامه می‌دهیم."
+    warn "کانفیگ با X25519MLKEM768 پذیرفته نشد؛ بدون آن ادامه می‌دهیم."
     PQ_ON=0
   elif [ "$H3_ON" -eq 1 ]; then
     warn "کانفیگ با HTTP/3 پذیرفته نشد؛ بدون آن ادامه می‌دهیم."
@@ -741,7 +982,6 @@ if [ "$NO_DRY" -eq 0 ] && [ "$STAGING" -eq 0 ]; then
 fi
 
 # ============================ تأیید خودکار سرویس ============================
-# همه‌ی بررسی‌ها از همین سرور انجام می‌شود. اگر IP عمومی پیدا شود، با همان IP تست می‌شود.
 info "تأیید خودکار سرویس"
 if [ -n "$LOCAL_PORT" ]; then
   TEST_HOST="127.0.0.1"; TEST_PORT="$LOCAL_PORT"
@@ -773,7 +1013,7 @@ ADV=0; if [[ "$ALT_SVC" == *'h3=":443"'* ]]; then ADV=1; fi
 H3R=0; if [ "$H3_REAL" = "3" ]; then H3R=1; fi
 SECOK=0; if [ "$SEC_CODE" = "200" ]; then SECOK=1; fi
 
-show_check() { # $1 = 1/0   $2 = برچسب
+show_check() {
   if [ "$1" -eq 1 ]; then echo " ${G}✔${N} $2"; else echo " ${R}✘${N} $2"; fi
 }
 
@@ -793,16 +1033,20 @@ show_check "$SECOK" "صفحه‌ی امنیت /security (کد HTTP: ${SEC_CODE:-
 echo
 
 if [ "$ADV" -eq 1 ] && [ "$H3R" -eq 0 ] && [ -z "$LOCAL_PORT" ]; then
-  warn "اگر HTTP/3 از اینترنت کار نمی‌کند، UDP 443 را در فایروال ابری یا گروه امنیتی VPS باز کنید. این مورد از داخل سرور قابل بررسی نیست."
+  warn "اگر HTTP/3 از اینترنت کار نمی‌کند، UDP 443 را در فایروال ابری یا پنل سرور باز کنید."
 fi
-if [ "$TLS13" -eq 0 ] || [ "$H2OK" -eq 0 ] || [ "$CERTOK" -eq 0 ] || [ "$SECOK" -eq 0 ]; then
-  warn "برخی بررسی‌های اصلی ناموفق بود. لاگ nginx: sudo tail -n 50 /var/log/nginx/error.log"
+
+# ============================ پاکسازی بعد از ارتقا ===========================
+if [ "$AFTER_UPGRADE" -eq 1 ]; then
+  rm -f "$RESUME_UNIT" "$OS_RUNNER"
+  systemctl daemon-reload || true
+  ok "ادامه‌ی نصب بعد از ارتقا کامل شد"
 fi
 
 # ============================ خلاصه =========================================
 SHORT_ID=$(openssl rand -hex 8)
 mark() { if [ "$1" -eq 1 ]; then echo "✔"; else echo "✘"; fi; }
-pq_txt="✘ (OpenSSL ۳٫۵+ لازم است)"; if [ "$PQ_OK" -eq 1 ]; then pq_txt="✔"; fi
+pq_txt="✘"; if [ "$PQ_OK" -eq 1 ]; then pq_txt="✔"; fi
 h3_line="✘"; if [ "$ADV" -eq 1 ]; then h3_line="✔ (اعلام شده)"; fi
 if [ -n "$H3_REAL" ] && [ "$H3R" -eq 1 ]; then h3_line="✔ (تست واقعی موفق)"; fi
 
@@ -812,6 +1056,7 @@ ${G}==============================================================${N}
  ✅ نصب تمام شد  →  https://$DOMAIN
 ${G}==============================================================${N}
  nginx              : $(nginx_version)
+ OpenSSL            : $(openssl version | awk '{print $2}')
  TLS 1.3            : $(mark "$TLS13")
  HTTP/2             : $(mark "$H2OK")
  X25519MLKEM768     : $pq_txt
