@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  install-site.sh  |  وبلاگ فنی با nginx، TLS 1.3، HTTP/2، HTTP/3 و X25519MLKEM768
-#  نسخه ۷ (همراه با کامپایل خودکار و ایزوله‌ی OpenSSL 3.5 برای تبادل کلید پساکوانتومی)
+#  نسخه ۸ (مدیریت دامنه: نصب، تغییر، حذف و تغییر ایمیل ACME)
 # =============================================================================
 set -Eeuo pipefail
 
@@ -18,7 +18,11 @@ SCRIPT_SELF="$(readlink -f "$0")"
 usage() {
 cat <<'EOF'
 استفاده:
-  sudo bash install-site.sh [دامنه] [گزینه‌ها]
+  sudo bash install-site.sh                              منوی تعاملی
+  sudo bash install-site.sh [دامنه] [گزینه‌ها]           نصب سایت
+  sudo bash install-site.sh --replace old.com new.com    تغییر دامنه
+  sudo bash install-site.sh --remove old.com             حذف کامل یک دامنه
+  sudo bash install-site.sh --update-email me@mail.com   تغییر ایمیل ACME
 
 گزینه‌ها:
   -d, --domain دامنه        نام دامنه (یا به‌صورت آرگومان اول)
@@ -36,6 +40,9 @@ cat <<'EOF'
       --overwrite-site      فایل‌های سایت را از نو بنویس
       --no-firewall         به فایروال دست نزن
       --no-dryrun           تست تمدید خودکار را انجام نده
+      --remove              حذف کامل یک دامنه (nginx، گواهی و فایل‌های سایت)
+      --replace دامنه_قدیم  حذف دامنه قدیم قبل از نصب دامنه جدید (تغییر دامنه)
+      --update-email ایمیل  تغییر ایمیل حساب ACME بدون نصب مجدد
   -h, --help                راهنما
 EOF
 }
@@ -404,6 +411,7 @@ HTTP_ONLY_CONF() {
   local l80_v6=""
   if [ "$HAS_V6" -eq 1 ]; then l80_v6="listen [::]:80 default_server;"; fi
   cat > "$CONF" <<EOF
+# install-site
 server {
     listen 80 default_server;
     $l80_v6
@@ -434,6 +442,7 @@ write_nginx_conf() {
   if [ "$pq" -eq 1 ]; then pq_line="ssl_ecdh_curve X25519MLKEM768:X25519:prime256v1;"; fi
 
   cat > "$CONF" <<EOF
+# install-site
 server {
     listen 80 default_server;
     $l80_v6
@@ -570,6 +579,7 @@ build_resume_args() {
   if [ "$NO_DRY" -eq 1 ]; then a+=(--no-dryrun); fi
   if [ "$NO_NGINX_REPO" -eq 1 ]; then a+=(--no-nginx-repo); fi
   if [ "$NO_BUILD_OPENSSL" -eq 1 ]; then a+=(--no-build-openssl); fi
+  if [ -n "$REPLACE_DOMAIN" ]; then a+=(--replace "$REPLACE_DOMAIN"); fi
   RESUME_ARGS="${a[*]}"
   return 0
 }
@@ -706,6 +716,173 @@ os_upgrade_flow() {
   exit 0
 }
 
+# ============================ توابع مدیریت دامنه ============================
+MANAGED_SIG="script-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
+
+normalize_domain() {
+  local d="${1,,}"
+  d="${d#http*://}"; d="${d%%/*}"; d="${d%.}"
+  printf '%s' "$d"
+}
+
+validate_domain() {
+  [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]] || die "دامنه نامعتبر است: $1"
+}
+
+# فهرست سایت‌هایی که همین اسکریپت ساخته است
+list_managed() {
+  local f
+  for f in /etc/nginx/sites-available/*; do
+    [ -f "$f" ] || continue
+    if grep -qsF -e 'install-site' -e "$MANAGED_SIG" "$f"; then
+      basename "$f"
+    fi
+  done
+}
+
+choose_managed() {
+  local -a list=()
+  local d sel i=1
+  while IFS= read -r d; do list+=("$d"); done < <(list_managed)
+  if [ "${#list[@]}" -eq 0 ]; then
+    warn "هیچ سایتی که با این اسکریپت ساخته شده باشد پیدا نشد."
+    return 1
+  fi
+  echo "سایت‌های موجود:"
+  for d in "${list[@]}"; do
+    echo "  $i) $d"
+    i=$((i + 1))
+  done
+  read -r -p "شماره یا نام دامنه را وارد کنید: " sel
+  if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#list[@]}" ]; then
+    CHOSEN="${list[$((sel - 1))]}"
+    return 0
+  fi
+  sel=$(normalize_domain "$sel")
+  for d in "${list[@]}"; do
+    if [ "$d" = "$sel" ]; then CHOSEN="$d"; return 0; fi
+  done
+  warn "این مورد در لیست نیست."
+  return 1
+}
+
+interactive_menu() {
+  local choice old
+  while true; do
+    echo
+    echo "${C}========== مدیریت سایت ==========${N}"
+    echo "  ۱) نصب سایت روی یک دامنه جدید"
+    echo "  ۲) تغییر دامنه (حذف دامنه قبلی و نصب دامنه جدید)"
+    echo "  ۳) تغییر ایمیل حساب ACME (بدون نصب مجدد)"
+    echo "  ۴) حذف کامل یک دامنه"
+    echo "  ۰) خروج"
+    read -r -p "انتخاب شما: " choice
+    case "$choice" in
+      1)
+        read -r -p "نام دامنه جدید: " DOMAIN
+        ACTION="install"; return 0 ;;
+      2)
+        choose_managed || continue
+        old="$CHOSEN"
+        read -r -p "دامنه جدید: " DOMAIN
+        REPLACE_DOMAIN="$old"; ACTION="install"; return 0 ;;
+      3)
+        read -r -p "ایمیل جدید: " EMAIL
+        ACTION="email"; return 0 ;;
+      4)
+        choose_managed || continue
+        DOMAIN="$CHOSEN"; ACTION="remove"; return 0 ;;
+      0) exit 0 ;;
+      *) warn "گزینه نامعتبر است." ;;
+    esac
+  done
+}
+
+# حذف کامل یک دامنه: کانفیگ nginx، گواهی، فایل‌های سایت (با بکاپ)
+remove_site() {
+  local d="$1"
+  local conf="/etc/nginx/sites-available/$d"
+  local link="/etc/nginx/sites-enabled/$d"
+  local root="/var/www/$d"
+  local le_live="/etc/letsencrypt/live/$d"
+  local le_renew="/etc/letsencrypt/renewal/$d.conf"
+
+  [ -n "$d" ] || die "دامنه‌ای برای حذف مشخص نشده."
+  if [ ! -e "$conf" ] && [ ! -L "$link" ] && [ ! -d "$root" ] && [ ! -d "$le_live" ] && [ ! -f "$le_renew" ]; then
+    warn "چیزی از $d روی این سرور پیدا نشد."
+    return 0
+  fi
+
+  info "حذف سایت $d"
+
+  if systemctl is-active --quiet xray 2>/dev/null; then
+    warn "Xray فعال است. اگر serverNames تنظیمات Reality به $d اشاره می‌کند، باید به دامنه جدید تغییر کند."
+  fi
+
+  rm -f "$link" "$conf"
+  if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/tmp/nginx-remove.log 2>&1; then
+      if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
+      ok "کانفیگ nginx مربوط به $d حذف شد"
+    else
+      cat /tmp/nginx-remove.log >&2
+      warn "nginx بعد از حذف کانفیگ خطا دارد؛ لطفاً بررسی کنید."
+    fi
+    rm -f /tmp/nginx-remove.log
+  fi
+
+  if [ -d "$le_live" ] || [ -f "$le_renew" ]; then
+    if certbot delete --cert-name "$d" --non-interactive </dev/null >/tmp/certbot-delete.log 2>&1; then
+      ok "گواهی $d حذف شد"
+    else
+      cat /tmp/certbot-delete.log >&2
+      warn "حذف گواهی ناموفق بود. دستی: certbot delete --cert-name $d"
+    fi
+    rm -f /tmp/certbot-delete.log
+  fi
+
+  if [ -d "$root" ]; then
+    local bk="/root/install-site-removed-$d-$(date +%F-%H%M).tgz"
+    if tar czf "$bk" -C /var/www "$d" 2>/dev/null; then
+      ok "بکاپ فایل‌های سایت: $bk"
+      rm -rf -- "$root"
+      ok "پوشه‌ی سایت $root حذف شد"
+    else
+      warn "بکاپ ساخته نشد؛ پوشه‌ی سایت حذف نشد."
+    fi
+  fi
+
+  ok "سایت $d حذف شد. nginx، OpenSSL، فایروال، Xray و سایر سایت‌ها دست‌نخورده ماندند."
+}
+
+# تغییر ایمیل حساب ACME بدون نصب مجدد
+update_email() {
+  local new="$1"
+  command -v certbot >/dev/null 2>&1 || die "certbot نصب نیست؛ ابتدا یک بار سایت را نصب کنید."
+  info "به‌روزرسانی ایمیل حساب ACME به $new"
+  if certbot update_account --email "$new" --non-interactive --agree-tos >/tmp/certbot-email.log 2>&1; then
+    ok "ایمیل حساب ACME به‌روز شد"
+  else
+    cat /tmp/certbot-email.log >&2
+    die "به‌روزرسانی ایمیل ناموفق بود."
+  fi
+  rm -f /tmp/certbot-email.log
+}
+
+# غیرفعال کردن سایت‌های قبلی این اسکریپت تا تداخل default_server پیش نیاید
+disable_other_managed() {
+  local keep="$1" f name
+  for f in /etc/nginx/sites-enabled/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    name=$(basename "$f")
+    if [ "$name" = "$keep" ]; then continue; fi
+    if grep -qsF -e 'install-site' -e "$MANAGED_SIG" "$f"; then
+      rm -f "$f"
+      warn "سایت قبلی «$name» از حالت فعال خارج شد تا با دامنه جدید تداخل نداشته باشد (فایل‌های آن حذف نشدند)."
+    fi
+  done
+}
+
 # ============================ بررسی‌های اولیه ================================
 [ "${EUID:-$(id -u)}" -eq 0 ] || die "با دسترسی root اجرا کنید (sudo)."
 command -v apt-get >/dev/null 2>&1 || die "فقط Debian/Ubuntu پشتیبانی می‌شود."
@@ -713,6 +890,7 @@ command -v apt-get >/dev/null 2>&1 || die "فقط Debian/Ubuntu پشتیبانی
 DOMAIN=""; EMAIL=""; LOCAL_PORT=""; CA="letsencrypt"; EAB_KID=""; EAB_HMAC=""
 STAGING=0; FORCE=0; OVERWRITE=0; NO_FW=0; NO_DRY=0; NO_NGINX_REPO=0; NO_BUILD_OPENSSL=0
 UPGRADE_OS=0; YES_UPGRADE=0; AFTER_UPGRADE=0; RESUME_ARGS=""
+ACTION="none"; REPLACE_DOMAIN=""; CHOSEN=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -722,6 +900,9 @@ while [ $# -gt 0 ]; do
     --ca)        [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; CA="$2"; shift 2 ;;
     --eab-kid)   [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; EAB_KID="$2"; shift 2 ;;
     --eab-hmac)  [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; EAB_HMAC="$2"; shift 2 ;;
+    --replace)   [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; REPLACE_DOMAIN="$2"; shift 2 ;;
+    --update-email) [ $# -ge 2 ] || die "مقدار $1 وارد نشده."; EMAIL="$2"; ACTION="email"; shift 2 ;;
+    --remove)    ACTION="remove"; shift ;;
     --no-nginx-repo) NO_NGINX_REPO=1; shift ;;
     --no-build-openssl) NO_BUILD_OPENSSL=1; shift ;;
     --upgrade-os) UPGRADE_OS=1; shift ;;
@@ -738,20 +919,43 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$DOMAIN" ]; then
-  [ -t 0 ] || die "دامنه وارد نشده. مثال: bash install-site.sh example.com"
-  read -r -p "نام دامنه را وارد کنید (example.com): " DOMAIN
+# تعیین عملیات: نصب، حذف، تغییر ایمیل یا منوی تعاملی
+if [ "$ACTION" = "none" ]; then
+  if [ -n "$DOMAIN" ]; then
+    ACTION="install"
+  elif [ -t 0 ]; then
+    interactive_menu
+  else
+    die "دامنه وارد نشده. مثال: bash install-site.sh example.com"
+  fi
 fi
-DOMAIN="${DOMAIN,,}"; DOMAIN="${DOMAIN#http*://}"; DOMAIN="${DOMAIN%%/*}"; DOMAIN="${DOMAIN%.}"
-[[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]] || die "دامنه نامعتبر است: $DOMAIN"
+if [ "$ACTION" = "remove" ] && [ -z "$DOMAIN" ]; then
+  [ -t 0 ] || die "برای حذف دامنه را بدهید: --remove example.com"
+  choose_managed || die "سایتی برای حذف پیدا نشد."
+  DOMAIN="$CHOSEN"
+fi
+
+if [ -n "$DOMAIN" ]; then
+  DOMAIN=$(normalize_domain "$DOMAIN"); validate_domain "$DOMAIN"
+fi
+if [ -n "$REPLACE_DOMAIN" ]; then
+  REPLACE_DOMAIN=$(normalize_domain "$REPLACE_DOMAIN"); validate_domain "$REPLACE_DOMAIN"
+  [ "$REPLACE_DOMAIN" != "$DOMAIN" ] || die "دامنه قدیم و جدید نباید یکی باشند."
+fi
 if [ -n "$EMAIL" ]; then
   [[ "$EMAIL" =~ ^[^@\ ]+@[^@\ ]+\.[^@\ ]+$ ]] || die "ایمیل نامعتبر است."
 fi
+if [ "$ACTION" = "email" ] && [ -z "$EMAIL" ]; then die "ایمیل وارد نشده است."; fi
 if [ -n "$LOCAL_PORT" ]; then
   if ! { [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && [ "$LOCAL_PORT" -ge 1024 ] && [ "$LOCAL_PORT" -le 65535 ]; }; then
     die "پورت --local باید بین 1024 تا 65535 باشد."
   fi
 fi
+
+case "$ACTION" in
+  email)  update_email "$EMAIL"; exit 0 ;;
+  remove) remove_site "$DOMAIN"; exit 0 ;;
+esac
 
 case "$CA" in
   letsencrypt)
@@ -888,6 +1092,12 @@ if [ -n "$DOMAIN_IP6" ]; then
     proceed_or_abort "دامنه رکورد AAAA ($DOMAIN_IP6) دارد که به این سرور اشاره نمی‌کند؛ حذفش کنید."
   fi
 fi
+
+# ============================ حذف دامنه قبلی و جلوگیری از تداخل ==============
+if [ -n "$REPLACE_DOMAIN" ]; then
+  remove_site "$REPLACE_DOMAIN"
+fi
+disable_other_managed "$DOMAIN"
 
 # ============================ ساخت فایل‌های وب‌سایت =========================
 mkdir -p "$ACME_ROOT"
