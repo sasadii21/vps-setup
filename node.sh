@@ -15,8 +15,8 @@
 #    sudo MODE=safe bash pg-node-optimizer.sh     # محافظه‌کار برای VPS یک‌هسته‌ای
 #
 #  گزینه‌ها (متغیر محیطی):
-#    RESTART_SERVICES=1   ری‌استارت docker / pg-node بعد از اعمال limit
-#    RECREATE_NODE=1      ساخت مجدد کانتینر نود تا ulimit داکر اعمال شود (قطعی کوتاه)
+#    RESTART_SERVICES=1   ری‌استارت سرویس‌های پاسارگارد به‌جز داکر
+#    RECREATE_NODE=0      نساز دوباره کانتینر (پیش‌فرض خودش Docker را ری‌استارت و نود را recreate می‌کند)
 #    DISABLE_IPV6=1       خاموش کردن IPv6 (اگر اینباند v6 داری نزن)
 #    AUTO_SWAP=0          نساختن swap
 #    TUNE_DOCKER=0        دست نزدن به /etc/docker/daemon.json
@@ -33,7 +33,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly STATE_DIR=/var/lib/pg-node-optimizer
 readonly BACKUP_DIR="${STATE_DIR}/backup-$(date +%Y%m%d-%H%M%S)"
 readonly SYSCTL_MAIN=/etc/sysctl.d/99-pasarguard-node.conf
@@ -53,7 +53,7 @@ readonly CHAIN_INPUT=PGNODE_OPT_IN
 MODE="${MODE:-auto}"
 DISABLE_IPV6="${DISABLE_IPV6:-0}"
 RESTART_SERVICES="${RESTART_SERVICES:-0}"
-RECREATE_NODE="${RECREATE_NODE:-0}"
+RECREATE_NODE="${RECREATE_NODE:-1}"
 AUTO_SWAP="${AUTO_SWAP:-1}"
 TUNE_DOCKER="${TUNE_DOCKER:-1}"
 TUNE_NIC="${TUNE_NIC:-1}"
@@ -554,7 +554,7 @@ else
 fi
 apply_unit_limits
 tune_docker_daemon
-ok "سقف nofile روی ${NOFILE} تنظیم شد. خودِ Xray داخل کانتینر این سقف را بعد از recreate می‌بیند."
+ok "سقف nofile روی ${NOFILE} تنظیم شد."
 
 # -----------------------------------------------------------------------------
 # ماژول‌ها: BBR، fq، conntrack، و wireguard که نود رسمی برایش لازم دارد
@@ -989,50 +989,176 @@ fi
 ok "ژورنال محدود شد."
 
 # -----------------------------------------------------------------------------
-# ری‌استارت اختیاری. پیش‌فرض قطعی نمی‌دهد.
+# سقف فایل داخل کانتینر. recreate به‌تنهایی کافی نیست؛ اول خود Docker باید
+# ری‌استارت شود، وگرنه کانتینر جدید باز هم با nofile برابر 1024 ساخته می‌شود.
 # -----------------------------------------------------------------------------
+patch_compose_ulimit() {
+    local compose=$1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$compose" "$NOFILE" <<'PY'
+import os, re, shutil, sys
+path, nofile = sys.argv[1], sys.argv[2]
+lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
+text = "".join(lines)
+if not re.search(r"pasarguard/node|ghcr\.io/pasarguard/node", text):
+    sys.exit(10)
+if re.search(r"(?m)^\s*nofile\s*:", text):
+    sys.exit(10)
+out = []
+inserted = False
+image_re = re.compile(r"image:\s*.*(pasarguard/node|ghcr\.io/pasarguard/node)")
+for line in lines:
+    out.append(line)
+    if inserted:
+        continue
+    if image_re.search(line):
+        indent = re.match(r"^(\s*)", line).group(1)
+        out.append(
+            "%sulimits:\n%snofile:\n%ssoft: %s\n%shard: %s\n"
+            % (indent, indent + "  ", indent + "    ", nofile, indent + "    ", nofile)
+        )
+        inserted = True
+if not inserted:
+    sys.exit(10)
+bak = path + ".pgopt-bak"
+if not os.path.exists(bak):
+    shutil.copy2(path, bak)
+tmp = path + ".pgopt-tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.write("".join(out))
+os.replace(tmp, path)
+sys.exit(0)
+PY
+}
+
+wait_docker() {
+    local i
+    for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
+container_soft_nofile() {
+    local id=$1 soft
+    soft=$(docker inspect "$id" --format '{{range .HostConfig.Ulimits}}{{if eq .Name "nofile"}}{{.Soft}}{{end}}{{end}}' 2>/dev/null || true)
+    if [ -z "${soft:-}" ]; then
+        echo 1024
+    else
+        echo "$soft"
+    fi
+}
+
+fix_pasarguard_container_nofile() {
+    command -v docker >/dev/null 2>&1 || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local -a files=()
+    local -A seen=()
+    local f dir id img name soft low=0 patched=0 compose_bin=""
+    shopt -s nullglob
+    for f in /opt/*/docker-compose.yml /opt/*/docker-compose.yaml \
+             /opt/*/compose.yml /opt/*/compose.yaml \
+             /opt/*/*/docker-compose.yml /opt/*/*/docker-compose.yaml; do
+        files+=("$f")
+    done
+    shopt -u nullglob
+    while read -r id img name; do
+        [ -n "${id:-}" ] || continue
+        case "$img" in
+            *pasarguard/node*|*ghcr.io/pasarguard/node*) ;;
+            *) continue ;;
+        esac
+        dir=$(docker inspect "$id" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+        if [ -n "$dir" ]; then
+            for f in "$dir"/docker-compose.yml "$dir"/docker-compose.yaml "$dir"/compose.yml "$dir"/compose.yaml; do
+                [ -f "$f" ] && files+=("$f")
+            done
+        fi
+        soft=$(container_soft_nofile "$id")
+        if [ "$soft" -lt "$NOFILE" ] 2>/dev/null; then
+            low=1
+        fi
+    done < <(docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' 2>/dev/null || true)
+
+    for f in "${files[@]+"${files[@]}"}"; do
+        [ -f "$f" ] || continue
+        grep -Eiq 'pasarguard/node|ghcr.io/pasarguard/node' "$f" || continue
+        dir=$(dirname "$f")
+        [ -n "${seen[$dir]:-}" ] && continue
+        seen[$dir]=1
+        if patch_compose_ulimit "$f"; then
+            patched=1
+            ok "سقف nofile داخل compose نوشته شد: $f"
+        fi
+    done
+
+    if [ "$low" -eq 0 ] && [ "$patched" -eq 0 ] && [ "${DOCKER_CHANGED:-0}" != "1" ]; then
+        ok "سقف فایل کانتینر نود از قبل درست است."
+        return 0
+    fi
+
+    info "ری‌استارت Docker و ساخت دوباره نود. اتصال چند ثانیه قطع می‌شود..."
+    systemctl restart containerd >/dev/null 2>&1 || true
+    if ! systemctl restart docker; then
+        warn "ری‌استارت docker ناموفق بود. journalctl -u docker -n 30"
+        return 1
+    fi
+    if ! wait_docker; then
+        warn "docker بالا نیامد. journalctl -u docker -n 30"
+        return 1
+    fi
+
+    if docker compose version >/dev/null 2>&1; then
+        compose_bin="docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        compose_bin="docker-compose"
+    else
+        warn "docker compose پیدا نشد."
+        return 1
+    fi
+
+    if [ "${#seen[@]}" -eq 0 ]; then
+        warn "فایل compose نود پاسارگارد پیدا نشد."
+        return 1
+    fi
+    for dir in "${!seen[@]}"; do
+        info "ساخت مجدد نود در ${dir} ..."
+        if (cd "$dir" && $compose_bin up -d --force-recreate); then
+            ok "نود دوباره ساخته شد: ${dir}"
+        else
+            warn "ساخت مجدد در ${dir} ناموفق بود."
+        fi
+    done
+
+    while read -r id img name; do
+        [ -n "${name:-}" ] || continue
+        case "$img" in
+            *pasarguard/node*|*ghcr.io/pasarguard/node*) ;;
+            *) continue ;;
+        esac
+        soft=$(docker exec "$name" sh -c 'ulimit -n' 2>/dev/null || echo '?')
+        if [ "$soft" = "$NOFILE" ]; then
+            ok "nofile داخل ${name}: ${soft}"
+        else
+            warn "nofile داخل ${name} هنوز ${soft} است."
+        fi
+    done < <(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' 2>/dev/null || true)
+}
+
 if [ "$RESTART_SERVICES" = "1" ]; then
     for unit in "${MODIFIED_UNITS[@]+"${MODIFIED_UNITS[@]}"}"; do
+        case "$unit" in
+            docker.service|containerd.service) continue ;;
+        esac
         systemctl try-restart "$unit" >/dev/null 2>&1 && ok "ری‌استارت شد: $unit" || true
     done
-else
-    if [ "${#MODIFIED_UNITS[@]}" -gt 0 ] || [ "$DOCKER_CHANGED" = "1" ]; then
-        warn "Limit جدید روی پروسس‌های در حال اجرا نشسته. برای اعمال، یک بار سرویس را ری‌استارت کن:"
-        if [ "${#MODIFIED_UNITS[@]}" -gt 0 ]; then
-            printf '    %s\n' "${MODIFIED_UNITS[@]}"
-        fi
-    fi
 fi
 
-if [ "$DOCKER_CHANGED" = "1" ]; then
-    warn "سقف فایل Xray داخل کانتینر فقط بعد از ساخته‌شدن دوباره کانتینر اعمال می‌شود."
-    if [ "$RECREATE_NODE" = "1" ]; then
-        shopt -s nullglob
-        found=0
-        for compose in /opt/*/docker-compose.yml; do
-            grep -Eiq 'pasarguard/node|ghcr.io/pasarguard/node' "$compose" || continue
-            dir=$(dirname "$compose")
-            found=1
-            info "ساخت مجدد کانتینر در ${dir} ..."
-            if docker compose version >/dev/null 2>&1; then
-                (cd "$dir" && docker compose up -d --force-recreate) \
-                    && ok "دوباره ساخته شد: ${dir}" \
-                    || warn "docker compose در ${dir} ناموفق بود."
-            elif command -v docker-compose >/dev/null 2>&1; then
-                (cd "$dir" && docker-compose up -d --force-recreate) \
-                    && ok "دوباره ساخته شد: ${dir}" \
-                    || warn "docker-compose در ${dir} ناموفق بود."
-            else
-                warn "docker compose پیدا نشد."
-            fi
-        done
-        shopt -u nullglob
-        [ "$found" -eq 1 ] || warn "compose نود پاسارگارد زیر /opt پیدا نشد. کانتینر را خودت recreate کن."
-    else
-        echo "    cd /opt/pg-node && docker compose up -d --force-recreate"
-        echo "    # یا اگر اسم دیگری گذاشتی، همان مسیر /opt/<name> را بزن"
-        echo "    # این کار چند ثانیه اتصال کاربر را قطع می‌کند."
-    fi
+if [ "$RECREATE_NODE" = "1" ] && [ "$TUNE_DOCKER" = "1" ]; then
+    fix_pasarguard_container_nofile || warn "اعمال خودکار سقف فایل کانتینر کامل نشد."
+elif [ "$RECREATE_NODE" != "1" ]; then
+    warn "RECREATE_NODE=0 است. سقف داخل کانتینر را خود اسکریپت عوض نمی‌کند."
 fi
 
 # -----------------------------------------------------------------------------
